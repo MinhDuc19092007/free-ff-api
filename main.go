@@ -18,7 +18,7 @@ import (
 )
 
 // ==================== CẤU HÌNH ====================
-var BOT_TOKEN = getEnvOrDefault("BOT_TOKEN", "7983734590:AAGoDuaSDiIQ5zaDuP1XhoCd3upAnS1UNsE")
+var BOT_TOKEN = getEnvOrDefault("BOT_TOKEN", "6382382620:AAFkTfdDxZJoK7g1DAdyle-22f-K62eLuWE")
 var ALLOWED_USERS = []int64{} // Thêm Telegram User ID được phép sử dụng, để trống = cho phép tất cả
 const PROXY_FILE = "proxy.txt"
 const BLACKLIST_FILE = "blacklist.txt"
@@ -896,3 +896,4 @@ func main() {
 		}
 	}
 }
+

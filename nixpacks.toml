@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "chromium", "xvfb-run", "glib", "nss", "nspr", "atk", "at-spi2-atk", "cups", "libdrm", "dbus", "libxkbcommon", "mesa", "alsa-lib", "pango", "cairo", "at-spi2-core"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "chmod +x main && xvfb-run --server-args=\"-screen 0 1280x1024x24\" ./main"

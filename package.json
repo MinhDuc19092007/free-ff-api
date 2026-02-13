@@ -1,0 +1,14 @@
+{
+  "name": "phantom-flood-bot",
+  "version": "2.0.0",
+  "description": "Telegram Bot for HTTP/2 Flood - Go + Node.js",
+  "scripts": {
+    "start": "./main"
+  },
+  "dependencies": {
+    "puppeteer-real-browser": "^1.4.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

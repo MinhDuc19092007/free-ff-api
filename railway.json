@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "chmod +x main && xvfb-run --server-args=\"-screen 0 1280x1024x24\" ./main",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}

